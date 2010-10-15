@@ -1,0 +1,831 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import sys
+import unicodedata
+import string
+import locale
+import os
+import errno
+import re
+import datetime
+import operator
+import ctypes
+import atexit
+import ConfigParser
+from optparse import OptionParser
+
+PROG_NAME = 'gen-album-views'
+
+try:
+    import mutagen
+    import mutagen.easyid3
+except ImportError:
+    print >> sys.stderr, 'You need mutagen python library >= 1.19'
+    sys.exit(1)
+
+HAVE_XDG = True
+try:
+    import xdg.BaseDirectory
+except:
+    HAVE_XDG = False
+
+def to_unicode(s):
+    if isinstance(s, str):
+        return unicode(s, locale.getpreferredencoding())
+    return s
+
+def to_unicode_from_fse(s):
+    if isinstance(s, str):
+        return unicode(s, sys.getfilesystemencoding())
+    return s
+
+def from_unicode(u):
+    if isinstance(u, unicode):
+        return u.encode(locale.getpreferredencoding())
+    return u
+
+_re_win32_incompat = re.compile(r'["*:<>?|]')
+def replace_win32_incompat(string, repl='_'):
+    return _re_win32_incompat.sub(repl, string)
+
+_re_slashes = re.compile(r'[\\/]')
+def sanitize_filename(string, repl='_'):
+    return _re_slashes.sub(repl, string)
+
+def sanitize_filename_complete(string, repl='_'):
+    tmp = replace_win32_incompat(string, repl=repl)
+    return sanitize_filename(tmp, repl=repl)
+
+def get_initial(ustr):
+    uch = ustr[0]
+    decomp = unicodedata.decomposition(uch)
+    if decomp:
+        uch = unichr(int(decomp.split(' ')[0],16))
+    upper = uch.encode('ascii', 'ignore').upper()
+    if upper and upper in string.ascii_uppercase:
+        return upper
+    return '0-9'
+
+def my_mutagen_easyid3_date_get(id3, key):
+    for key in ['TDRC', 'TDRL', 'TDOR']:
+        if key in id3:
+            break
+    return [stamp.text for stamp in id3[key].text]
+
+def album_get_metadata(dir_path):
+    f = None
+    for name in os.listdir(dir_path):
+        path = os.path.join(dir_path, name)
+        if os.path.isfile(path):
+            try:
+                f = mutagen.File(path, easy=True)
+            except:
+                f = None
+            if f:
+                break
+    return f
+
+def track_get_date(f):
+    if type(f) == mutagen.musepack.Musepack and type(f.tags) == mutagen.apev2.APEv2:
+        date = f.get('Year')
+    else:
+        date = f.get('date')
+        if type(date) == list:
+            date = date[0]
+    if not date:
+        return None
+    date = string.split(str(date), '-', 1)[0]
+    return int(date)
+
+def album_get_date(path):
+    f = album_get_metadata(path)
+    if not f:
+        return 0
+    date = track_get_date(f)
+    return date if date else 0
+
+def album_get_artist(path):
+    f = album_get_metadata(path)
+    artist = f.get('artist')
+    return artist if artist else '[no artist]'
+
+def CreateHardLink(src, dst):
+    if not ctypes.windll.kernel32.CreateHardLinkA(dst, src, 0):
+        raise OSError
+
+class FILETIME(ctypes.Structure):
+    _fields_ = [('dwLowDateTime',        ctypes.c_uint32),
+                ('dwHighDateTime',       ctypes.c_uint32)]
+
+class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+    _fields_ = [('dwFileAttributes',     ctypes.c_uint32),
+                ('ftCreationTime',       FILETIME),
+                ('ftLastAccessTime',     FILETIME),
+                ('ftLastWriteTime',      FILETIME),
+                ('dwVolumeSerialNumber', ctypes.c_uint32),
+                ('nFileSizeHigh',        ctypes.c_uint32),
+                ('nFileSizeLow',         ctypes.c_uint32),
+                ('nNumberOfLinks',       ctypes.c_uint32),
+                ('nFileIndexHigh',       ctypes.c_uint32),
+                ('nFileIndexLow',        ctypes.c_uint32)]
+
+def samefile_nt(p1, p2):
+    fh1 = ctypes.windll.kernel32.CreateFileA(p1, 0, 0, None, 3, 0x02000000, None)
+    fh2 = ctypes.windll.kernel32.CreateFileA(p2, 0, 0, None, 3, 0x02000000, None)
+
+    # This does not work, abs1 != abs2 for hard links ...
+    #size1 = ctypes.windll.kernel32.GetFinalPathNameByHandleA(fh1, 0, 0, 0)
+    #size2 = ctypes.windll.kernel32.GetFinalPathNameByHandleA(fh2, 0, 0, 0)
+
+    #abs_buf1 = ctypes.create_string_buffer(size1+2)
+    #abs_buf2 = ctypes.create_string_buffer(size2+2)
+
+    #ctypes.windll.kernel32.GetFinalPathNameByHandleA(fh1, abs_buf1, size1+1, 0)
+    #ctypes.windll.kernel32.GetFinalPathNameByHandleA(fh2, abs_buf2, size2+1, 0)
+
+    #abs1 = abs_buf1.value
+    #abs2 = abs_buf2.value
+
+    info1 = BY_HANDLE_FILE_INFORMATION()
+    info2 = BY_HANDLE_FILE_INFORMATION()
+
+    ctypes.windll.kernel32.GetFileInformationByHandle(fh1, ctypes.pointer(info1))
+    ctypes.windll.kernel32.GetFileInformationByHandle(fh2, ctypes.pointer(info2))
+
+    ctypes.windll.kernel32.CloseHandle(fh1)
+    ctypes.windll.kernel32.CloseHandle(fh2)
+
+    return info1.dwVolumeSerialNumber == info2.dwVolumeSerialNumber \
+            and info1.nFileIndexLow == info2.nFileIndexLow \
+            and info1.nFileIndexHigh == info2.nFileIndexHigh
+
+# From posixpath.py
+def relpath_posix(path, start=os.path.curdir):
+    """Return a relative version of a path"""
+
+    if not path:
+        raise ValueError("no path specified")
+
+    start_list = os.path.abspath(start).split(os.path.sep)
+    path_list = os.path.abspath(path).split(os.path.sep)
+
+    # Work out how much of the filepath is shared by start and path.
+    i = len(os.path.commonprefix([start_list, path_list]))
+
+    rel_list = [os.path.pardir] * (len(start_list)-i) + path_list[i:]
+    if not rel_list:
+        return os.path.curdir
+    return os.path.join(*rel_list)
+
+# From ntpath.py
+def relpath_nt(path, start=os.path.curdir):
+    """Return a relative version of a path"""
+
+    if not path:
+        raise ValueError("no path specified")
+    start_list = os.path.abspath(start).split(os.path.sep)
+    path_list = os.path.abspath(path).split(os.path.sep)
+    if start_list[0].lower() != path_list[0].lower():
+        unc_path, rest = splitunc(path)
+        unc_start, rest = splitunc(start)
+        if bool(unc_path) ^ bool(unc_start):
+            raise ValueError("Cannot mix UNC and non-UNC paths (%s and %s)"
+                                                                % (path, start))
+        else:
+            raise ValueError("path is on drive %s, start on drive %s"
+                                                % (path_list[0], start_list[0]))
+    # Work out how much of the filepath is shared by start and path.
+    for i in range(min(len(start_list), len(path_list))):
+        if start_list[i].lower() != path_list[i].lower():
+            break
+    else:
+        i += 1
+
+    rel_list = [os.path.pardir] * (len(start_list)-i) + path_list[i:]
+    if not rel_list:
+        return os.path.curdir
+    return os.path.join(*rel_list)
+
+class MusicDir(object):
+    def __init__(self, path, parse):
+        self.path = path
+        self.parse = parse
+    def load_releases(self):
+        releases = {}
+        for root, dirs, files in os.walk(self.path):
+            rel_root = os.path.relpath(root, self.path)
+            if not dirs and not files:
+                self.empty_dir(root)
+            album_data = self.parse(root, rel_root)
+            if files and not album_data:
+                self.files_above_album(root, files)
+            if dirs and album_data:
+                self.dirs_in_album(root, dirs)
+            if album_data:
+                artist = album_data['artist']
+                album = album_data['album']
+                if artist not in releases:
+                    releases[artist] = {}
+                if album in releases[artist]:
+                    self.duplicate_albums(root, releases[artist][album])
+                releases[artist][album] = album_data
+                releases[artist][album]['path'] = root
+                releases[artist][album]['relpath'] = rel_root
+                releases[artist][album]['files'] = set(files)
+        return releases
+
+class MusicDirClean(MusicDir):
+    def empty_dir(self, root):
+        Log.debug('remove empty directory %s', root)
+        FSOp.dir_remove(root)
+    def files_above_album(self, root, files):
+        for f in files:
+            fpath = os.path.join(root, f)
+            Log.debug('file in non-album, remove %s', fpath)
+            FSOp.file_remove(fpath)
+            files.remove(f)
+    def dirs_in_album(self, root, dirs):
+        for d in dirs:
+            dpath = os.path.join(root, d)
+            Log.debug('album directory contains other directories, removing %s', dpath)
+            FSOp.remove_recursive(dpath)
+            dirs.remove(d)
+    def duplicate_albums(self, root, old):
+            Log.debug('Duplicate releases found:\n1st: %s\n2nd: %s', old['path'], root)
+            FSOp.remove_recursive(root)
+
+class MusicDirCheck(MusicDir):
+    def empty_dir(self, root):
+        Log.error('Empty directory %s, aborting!', root),
+    def files_above_album(self, root, files):
+        Log.error('Files in non-album %s, aborting!', root)
+    def dirs_in_album(self, root, dirs):
+        Log.error('Album directory %s contains other directories!', root)
+    def duplicate_albums(self, root, old):
+        Log.error('Duplicate releases found:\n1st: %s\n2nd: %s', old['path'], root)
+
+class view(object):
+    def __init__(self, options={}, is_inview=False):
+        self.path = os.path.expanduser(options['output_dir'])
+    def parse(self, path, rel_path):
+        m = self.album_regexp.match(rel_path)
+        if m:
+            return m.groupdict()
+        return {}
+    def create_dir(self):
+        if not os.path.exists(self.path):
+            os.makedirs(self.path)
+    def load_and_check(self):
+        md = MusicDirCheck(self.path, self.parse)
+        self.releases = md.load_releases()
+    def load_and_clean(self):
+        md = MusicDirClean(self.path, self.parse)
+        self.releases = md.load_releases()
+
+class view_by_arrival(view):
+    name = 'by_arrival'
+    album_pattern = [r'(?P<arrival>[0-9]{4})', r'(?P<artist>.*)', r'(?P<album>.*)']
+    album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
+    def __init__(self, options={}, is_inview=False):
+        super(view_by_arrival,self).__init__(options)
+        if 'index_dir' in options:
+            self.index_dir = os.path.expanduser(options['index_dir'])
+        else:
+            arrival_dir = os.path.join(DATA_ROOT, self.name)
+            self.index_dir = os.path.join(arrival_dir, sanitize_filename_complete(self.path))
+        self.index = {}
+        self.curr_year = datetime.date.today().year
+        self.curr_month = datetime.date.today().month
+        if is_inview:
+            if not os.path.exists(self.index_dir):
+                os.makedirs(self.index_dir)
+            for date_string in os.listdir(self.path):
+                path = os.path.join(self.index_dir, date_string)
+                f = open(path, 'w')
+                for artist in os.listdir(os.path.join(self.path, date_string)):
+                    if not artist in self.index:
+                        self.index[artist] = {}
+                    for album in os.listdir(os.path.join(self.path, date_string, artist)):
+                        self.index[artist][album] = date_string
+                        f.write(artist + os.sep + album + '\n')
+                f.close()
+        else:
+            if not os.path.exists(self.index_dir):
+                Log.error('no arrival index in %s, use %s as inview for the first time', self.index_dir, self.name)
+            for date_string in os.listdir(self.index_dir):
+                path = os.path.join(self.index_dir, date_string)
+                if os.path.isfile(path):
+                    f = open(path)
+                    for line in f:
+                        artist, album = os.path.split(line.strip())
+                        if not artist in self.index:
+                            self.index[artist] = {}
+                        self.index[artist][album] = date_string
+                    f.close()
+    def gen(self, m):
+        if 'arrival' not in m:
+            artist = m['artist']
+            album = m['album']
+            if artist in self.index and album in self.index[artist]:
+                m['arrival'] = self.index[artist][album]
+            else:
+                m['arrival'] = '%02d%02d' % (self.curr_year % 10, self.curr_month)
+        return '%s%s%s%s%s' % (m['arrival'], os.sep, m['artist'], os.sep, m['album'])
+
+class view_by_initial(view):
+    name = 'by_initial'
+    album_pattern = [r'(?:[A-Z]|0-9)', r'(?P<artist>.*)', r'(?P<album>.*)']
+    album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
+    def gen(self, m):
+        if 'initial' not in m:
+            m['initial'] = get_initial(to_unicode(m['artist']))
+        return '%s%s%s%s%s' % (m['initial'], os.sep, m['artist'], os.sep, m['album'])
+
+class view_by_initial_range(view):
+    name = 'by_initial_range'
+    n_middle = len(string.ascii_uppercase)/2
+    middle = string.ascii_uppercase[n_middle]
+    album_pattern = [r'(?:A-M|N-Z)', r'(?P<artist>.*)', r'(?P<album>.*)']
+    album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
+    def gen(self, m):
+        if 'initial' not in m:
+            m['initial'] = get_initial(to_unicode(m['artist']))
+        if 'initial_range' not in m:
+            m['initial_range'] = ('A-M' if m['initial'] < self.middle else 'N-Z')
+        return '%s%s%s%s%s' % (m['initial_range'], os.sep, m['artist'], os.sep, m['album'])
+
+class view_by_artist(view):
+    name = 'by_artist'
+    album_pattern = [r'(?P<artist>.*)', r'(?P<album>.*)']
+    album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
+    def gen(self, m):
+        return '%s%s%s' % (m['artist'], os.sep, m['album'])
+
+class view_by_initial_and_year(view):
+    name = 'by_initial_and_year'
+    album_pattern = [r'(?P<initial>[A-Z]|0-9)', r'(?P<artist>.*)', r'(?P<date>[0-9]*) - (?P<album>.*)']
+    album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
+    def parse(self, path, rel_path):
+        m = self.album_regexp.match(rel_path)
+        if m:
+            d = m.groupdict()
+            d['date'] = int(d['date'])
+            return d
+        return {}
+    def gen(self, m):
+        if 'initial' not in m:
+            m['initial'] = get_initial(to_unicode(m['artist']))
+        if 'date' not in m:
+            m['date'] = album_get_date(m['path'])
+        return '%s%s%s%s%04d - %s' % (m['initial'], os.sep, m['artist'], os.sep, m['date'], m['album'])
+
+
+class view_by_date(view):
+    name = 'by_date'
+    album_pattern = [r'(?P<date>[0-9]*)', r'(?P<artist>.*)', r'(?P<album>.*)']
+    album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
+    curr_year = datetime.date.today().year
+    curr_decade = curr_year / 10 * 10
+    last_decade = curr_decade - 10 if curr_year - curr_decade >= 5 else curr_decade - 20
+    def parse(self, path, rel_path):
+        m = self.album_regexp.match(rel_path)
+        if m:
+            d = m.groupdict()
+            d['date'] = int(d['date'])
+            return d
+        return {}
+    def gen(self, m):
+        if 'date' not in m:
+            m['date'] = album_get_date(m['path'])
+        if 'decade' not in m:
+            date = m['date']
+            decade = date / 10 * 10
+            if decade > self.last_decade:
+                decade = date
+            m['decade'] = decade
+        return '%d%s%s%s%s' % (m['decade'], os.sep, m['artist'], os.sep, m['album'])
+
+view_class_lookup = dict((x.name, x) for x in (
+    view_by_arrival,
+    view_by_initial,
+    view_by_initial_and_year,
+    view_by_date,
+    view_by_initial_range,
+    view_by_artist,
+))
+
+def shellquote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+class FSOp(object):
+    simulate = False
+    @classmethod
+    def file_link(cls, source, link_name):
+        Log.fileop('link %s %s', source, link_name)
+        if cls.simulate:
+            return
+        os.link(source, link_name)
+    @classmethod
+    def file_remove(cls, path):
+        Log.fileop('unlink %s', path)
+        if cls.simulate:
+            return
+        os.remove(path)
+    @classmethod
+    def dir_remove(cls, path):
+        Log.fileop('rmdir %s', path)
+        if cls.simulate:
+            return
+        os.rmdir(path)
+    @classmethod
+    def dir_make_all(cls, path):
+        Log.fileop('mkdir -p %s', path)
+        if cls.simulate:
+            return
+        if not os.path.exists(path):
+            os.makedirs(path)
+    @classmethod
+    def rename(cls, src, dst):
+        Log.fileop('mv %s %s', src, dst)
+        if cls.simulate:
+            return
+        os.rename(src, dst)
+    @classmethod
+    def remove_recursive(cls, top):
+        Log.fileop('rm -rf %s', top)
+        if cls.simulate:
+            return
+        for root, dirs, files in os.walk(top, topdown=False):
+            for name in files:
+                os.remove(os.path.join(root, name))
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+        os.rmdir(top)
+
+def copy_album(album, outview):
+    new_album_dir = os.path.join(outview.path, outview.gen(album))
+    FSOp.dir_make_all(new_album_dir)
+    for f in album['files']:
+        in_path = os.path.join(album['path'], f)
+        out_path = os.path.join(new_album_dir, f)
+        FSOp.file_link(in_path, out_path)
+
+def copy_albums(albums, outview):
+    for name in albums:
+        copy_album(albums[name], outview)
+
+def path_least_common_ancestor(p1, p2):
+    p1 = os.path.abspath(p1)
+    p2 = os.path.abspath(p2)
+    while p1 != p2:
+        if len(p1) > len(p2):
+            p1, p2 = p2, p1
+        p2 = os.path.dirname(p2)
+    return p1
+
+def dir_cleanup_empty(old, new):
+    path = os.path.abspath(os.path.dirname(old))
+    lca = path_least_common_ancestor(path, new)
+    while path != lca:
+        if os.listdir(path) == []:
+            FSOp.dir_remove(path)
+        else:
+            break
+        path = os.path.dirname(path)
+
+def update_album(in_album, out_album, outview):
+    new_album_relpath = outview.gen(in_album)
+    if new_album_relpath != out_album['relpath']:
+        new_album_path = os.path.join(outview.path, new_album_relpath)
+        if os.path.exists(new_album_path):
+            FSOp.remove_recursive(new_album_path)
+        FSOp.dir_make_all(os.path.dirname(new_album_path))
+        FSOp.rename(out_album['path'], new_album_path)
+        dir_cleanup_empty(out_album['path'], new_album_path)
+        out_album['path'] = new_album_path
+        out_album['relpath'] = new_album_relpath
+
+    intersect = in_album['files'] & out_album['files']
+    in_only = in_album['files'] - intersect
+    out_only = out_album['files'] - intersect
+    for f in intersect:
+        in_path = os.path.join(in_album['path'], f)
+        out_path = os.path.join(out_album['path'], f)
+        if not os.path.samefile(in_path, out_path):
+            FSOp.file_remove(out_path)
+            FSOp.file_link(in_path, out_path)
+        out_album['files'].remove(f)
+    for f in in_only:
+        in_path = os.path.join(in_album['path'], f)
+        out_path = os.path.join(out_album['path'], f)
+        FSOp.file_link(in_path, out_path)
+    for f in out_only:
+        out_path = os.path.join(out_album['path'], f)
+        FSOp.file_remove(out_path)
+        out_album['files'].remove(f)
+
+class PercentStatus(object):
+    def __init__(self, all, prefix=''):
+        self.num = 0
+        self.all = all
+        self.msg = ''
+        if prefix:
+            Log.info('%s', prefix, end='')
+    def inc(self, num):
+        self.num += num
+    def update(self, num):
+        self.num = num
+    def gen_msg(self):
+        if self.all > 0:
+            f = 100.0*float(self.num)/float(self.all)
+        else:
+            f = 100.0
+        self.new_msg = '%6.2f%%' % (f,)
+    def output(self):
+        self.gen_msg()
+        if self.new_msg != self.msg:
+            Log.info('%s', '\b' * len(self.msg) + self.new_msg, end='')
+            self.msg = self.new_msg
+    def finish(self):
+        Log.info()
+
+def copy_view(inview, outview):
+    in_releases = inview.releases
+    out_releases = outview.releases
+    release_count = len(reduce(operator.add, [in_releases[x].keys() for x in in_releases], []))
+    status = PercentStatus(release_count)
+    status.output()
+    for artist_name in in_releases:
+        in_albums = in_releases[artist_name]
+        if artist_name not in out_releases:
+            copy_albums(in_albums, outview)
+            status.inc(len(in_albums))
+        else:
+            out_albums = out_releases[artist_name]
+            for album_name in in_albums:
+                if album_name not in out_albums:
+                    copy_album(in_albums[album_name], outview)
+                else:
+                    update_album(in_albums[album_name], out_albums[album_name], outview)
+                    if not out_albums[album_name]['files']:
+                        del out_albums[album_name]
+                status.inc(1)
+            if not out_albums:
+                del out_releases[artist_name]
+        status.output()
+    status.finish()
+
+def clean_view(view):
+    releases = view.releases
+    release_count = len(reduce(operator.add, [releases[x].keys() for x in releases], []))
+    status = PercentStatus(release_count)
+    status.output()
+    for artist_name in releases:
+        out_albums = releases[artist_name]
+        for album_name in out_albums:
+            FSOp.remove_recursive(out_albums[album_name]['path'])
+            #del out_albums[album_name]
+            status.inc(1)
+        status.output()
+    status.finish()
+
+# from Gajim
+def set_config_paths():
+    global CONFIG_ROOT, CACHE_ROOT, DATA_ROOT, DEFAULT_CONFFILE
+
+    if os.name == 'nt':
+        try:
+            CONFIG_ROOT = CACHE_ROOT = DATA_ROOT = \
+                    os.path.join(to_unicode_from_fse(os.environ['appdata']), PROG_NAME)
+        except KeyError:
+            CONFIG_ROOT = CACHE_ROOT = DATA_ROOT = '.'
+    else:
+        if HAVE_XDG:
+            CONFIG_ROOT = xdg.BaseDirectory.load_first_config(PROG_NAME)
+            if not CONFIG_ROOT:
+                CONFIG_ROOT = os.path.join(xdg.BaseDirectory.xdg_config_dirs[0], PROG_NAME)
+            CACHE_ROOT = os.path.join(xdg.BaseDirectory.xdg_cache_home, PROG_NAME)
+            DATA_ROOT = xdg.BaseDirectory.save_data_path(PROG_NAME)
+            if not DATA_ROOT:
+                DATA_ROOT = os.path.join(xdg.BaseDirectory.xdg_data_dirs[0], PROG_NAME)
+        else:
+            expand = os.path.expanduser
+            base = os.getenv('XDG_CONFIG_HOME') or expand('~/.config')
+            CONFIG_ROOT = os.path.join(base, PROG_NAME)
+            base = os.getenv('XDG_CACHE_HOME') or expand('~/.cache')
+            CACHE_ROOT = os.path.join(base, PROG_NAME)
+            base = os.getenv('XDG_DATA_HOME') or expand('~/.local/share')
+            DATA_ROOT = os.path.join(base, PROG_NAME)
+
+    DEFAULT_CONFFILE = os.path.join(CONFIG_ROOT, 'default.conf')
+
+def check_pidfile():
+    if not os.path.exists(PIDFILE):
+        return
+    f = open(PIDFILE, 'r')
+    line = f.read().strip()
+    f.close()
+    if not line:
+        remove_pidfile()
+    pid = int(line)
+    try:
+        os.kill(pid, 0)
+    except OSError, err:
+        if err.errno == errno.ESRCH:
+            Log.info('Removing stale pidfile %s', PIDFILE)
+            return
+        elif err.errno == errno.EPERM:
+            Log.error('No permission to signal process %d, remove %s manually!', pid, PIDFILE)
+        else:
+            Log.error('Unknown error while signalling process %d, remove %s manually!', pid, PIDFILE)
+    else:
+        Log.error('already running, if not remove %s manually!', PIDFILE)
+
+def create_pidfile():
+    piddir = os.path.dirname(PIDFILE)
+    if not os.path.exists(piddir):
+        os.makedirs(piddir)
+    pid = os.getpid()
+    f = open(PIDFILE, 'w')
+    f.write(str(pid))
+    f.close()
+
+def remove_pidfile():
+    if os.path.exists(PIDFILE):
+        os.remove(PIDFILE)
+
+class Log(object):
+    verbosity = 1
+    debugging = False
+    cmd_file = None
+    @classmethod
+    def error(cls, msg='', *args, **kwargs):
+        msg = from_unicode(msg)
+        args = tuple(map(from_unicode, args))
+        msg = msg % args
+        print >> sys.stderr, msg
+        sys.exit(1)
+    @classmethod
+    def info(cls, msg='', *args, **kwargs):
+        if cls.verbosity < 1:
+            return
+        msg = from_unicode(msg)
+        args = tuple(map(from_unicode, args))
+        msg = msg % args
+        end = kwargs['end'] if 'end' in kwargs else '\n'
+        sys.stdout.write(msg+end)
+        sys.stdout.flush()
+    @classmethod
+    def debug(cls, msg='', *args, **kwargs):
+        if not cls.debugging:
+            return
+        msg = from_unicode(msg)
+        args = tuple(map(from_unicode, args))
+        msg = msg % args
+        print >> sys.stdout, msg
+    @classmethod
+    def fileop(cls, msg='', *args, **kwargs):
+        if not cls.cmd_file:
+            return
+        msg = from_unicode(msg)
+        args = tuple(map(from_unicode, args))
+        msg = msg % tuple(shellquote(x) for x in args)
+        print >> cls.cmd_file, msg
+
+def close_cmd_file():
+    if Log.cmd_file:
+        Log.cmd_file.close()
+
+def main(argv=sys.argv):
+
+    global PIDFILE
+
+    if mutagen.version < (1,19):
+        Log.error('Error: Need at least version 1.19 of mutagen python module')
+
+    if not 'link' in dir(os) and os.name == 'nt':
+        os.link = CreateHardLink
+
+    # remove when python2.6 is standard in debian stable
+    if 'relpath' not in dir(os.path):
+        if os.name == 'nt':
+            os.path.relpath = relpath_nt
+        else:
+            os.path.relpath = relpath_posix
+    # remove when python3.2 is standard in debian stable
+    if 'samefile' not in dir(os.path) and os.name == 'nt':
+        os.path.samefile = samefile_nt
+
+    if 'kill' not in dir(os):
+        os.kill = lambda x, y: 0
+
+    mutagen.easyid3.EasyID3.RegisterKey('date', getter=my_mutagen_easyid3_date_get)
+
+    set_config_paths()
+
+    usage = 'usage: %prog [options] [output_views]'
+    version = '%prog 1.0'
+    description = 'Generate additional indices of a well structured music collection via hardlinks.'
+
+    parser = OptionParser(usage=usage, version=version, description=description)
+    parser.set_defaults(verbosity=Log.verbosity)
+    parser.add_option('-c', action='store', dest='config_filename', default=DEFAULT_CONFFILE,
+            metavar='FILE', help='use FILE as config file')
+    parser.add_option('-i', action='store', dest='inview', metavar='VIEW',
+            help='use VIEW as source directory')
+    parser.add_option('-n', action='store_true', dest='simulate', default=FSOp.simulate,
+            help='only simulate, no real action')
+    parser.add_option('-d', action='store_true', dest='debugging', default=Log.debugging,
+            help='enable some debugging output to stderr')
+    parser.add_option('-q', action='store_const', dest='verbosity', const=0,
+            help='be silent')
+    parser.add_option('-f', action='store', dest='cmd_file', type='string', metavar='FILE',
+            help='log all filesystem operations to FILE')
+    parser.add_option('--create-default-config', action='store_true', dest='create_defconf',
+            help='create default config file')
+    (options, args) = parser.parse_args(argv[1:])
+
+    config = ConfigParser.ConfigParser()
+    if not config.read(options.config_filename):
+        if options.create_defconf:
+            config.set('DEFAULT', 'inview', 'PATH_TO_DIRECTORY')
+            views = view_class_lookup.keys()
+            if args:
+                views = [x for x in views if x in args]
+            for v in views:
+                config.add_section(v)
+                config.set(v, 'output_dir', 'PATH_TO_DIRECTORY')
+            f = open(options.config_filename, 'w')
+            config.write(f)
+            f.close()
+            print 'default config file created, now edit "%s"' % options.config_filename
+            sys.exit()
+        else:
+            Log.error('Could not read config file "%s", please create one using --create-default-config or use -c', options.config_filename)
+    elif options.create_defconf:
+        Log.error('Will not overwrite existing config file "%s", please move first', options.config_filename)
+
+    PIDFILE = os.path.join(CACHE_ROOT, sanitize_filename_complete(options.config_filename)+'.pid')
+
+    check_pidfile()
+    atexit.register(remove_pidfile)
+    atexit.register(close_cmd_file)
+    create_pidfile()
+
+    cfg_defaults = config.defaults()
+    inview = None
+    if 'inview' in cfg_defaults:
+        inview = cfg_defaults['inview']
+    if options.inview:
+        inview = options.inview
+    if not inview:
+        Log.error('no input view specified (-i view or in %s)', options.config_filename)
+
+    views = {}
+    for s in config.sections():
+        if s in view_class_lookup:
+            views[s] = view_class_lookup[s](dict(config.items(s)), s == inview)
+        else:
+            Log.error('there is no view "%s", please check spelling', s)
+
+    if inview not in views:
+        Log.error('input view %s not configured in %s', inview, options.config_filename)
+    outviews = views.keys()
+    outviews.remove(inview)
+
+    if args:
+        outviews = [x for x in outviews if x in args]
+
+    if not outviews:
+        Log.error('no views defined for output, aborting')
+
+    Log.verbosity = options.verbosity
+    Log.debugging = options.debugging
+    if options.cmd_file:
+        Log.cmd_file = open(options.cmd_file, 'w')
+    FSOp.simulate = options.simulate
+
+    if not os.path.exists(views[inview].path):
+        Log.error('input directory %s doesn\'t exist!', views[inview].path)
+
+    step = 1
+    steps = len(outviews) + 1
+
+    Log.info('[%d/%d] %s: load and check', step, steps, inview)
+    views[inview].load_and_check()
+    for name in outviews:
+        step += 1
+        Log.info('[%d/%d] %s:', step, steps, name)
+        Log.info('      1/3 load and clean')
+        views[name].load_and_clean()
+        Log.info('      2/3 copy files:        ', end='')
+        copy_view(views[inview], views[name])
+        Log.info('      3/3 delete remainings: ', end='')
+        clean_view(views[name])
+
+    remove_pidfile()
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

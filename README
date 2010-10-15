@@ -1,0 +1,96 @@
+-------------------
+| gen-album-views |
+-------------------
+
+This script generates different views of your music collection via hard links
+(e.g. alphabetic, by release date, ...). It is build upon these premises:
+
+- the only addressable entity is an album (or release), not e.g. single songs
+- albums are directories at the same directory tree depth, e.g.:
+    B/Beatles/Revolver
+    R/Rolling Stones/Let It Bleed
+  (albums at depth 3 relative to root)
+  They can only contain files, not other directories.
+- the music collection must consist solely of albums at the same depth
+
+Currently four views are implemented, but it is very easy to write additional
+ones:
+
+- by_arrival
+    0603/Rolling Stones/Let It Bleed
+    0905/Beatles/Revolver
+
+- by_initial
+    B/Beatles/Revolver
+    R/Rolling Stones/Let It Bleed
+
+- by_initial_and_year
+    B/Beatles/1966 - Revolver
+    R/Rolling Stones/1969 - Let It Bleed
+
+- by_date
+    1960/Beatles/Revolver
+    1960/Rolling Stones/Let It Bleed
+
+- view_by_initial_range
+    A-M/Beatles/1966 - Revolver
+    N-Z/Rolling Stones/Let It Bleed
+
+- view_by_artist
+    Beatles/Revolver
+    Rolling Stones/Let It Bleed
+
+Of course these views can be easily generated and visualized by music players
+which utilize a database. The advantage of this approach is it's generality:
+It works with every software (file browser, different audio players) and also
+on different computers (ftp, nfs, external hard drive).
+
+The information for generating the views is collected from three different
+sources:
+
+1. Path name (e.g. artist, album)
+2. Tags in music files (e.g. date)
+3. Text files (e.g. arrival date)
+
+
+-----------------
+| Invocation    |
+-----------------
+
+gen-album-views [options] [output_views]
+
+Options:
+  --version                 show program's version number and exit
+  -h, --help                show this help message and exit
+  -c FILE, --config=FILE    use config file FILE
+  -i VIEW, --inview=VIEW    use VIEW as source directory
+  -n, --simulate            only simulate, no real action
+  -d, --debug               enable some debugging output to stderr
+  -q, --quiet               be silent
+  -f FILE, --cmd-file=FILE  log all filesystem operations to FILE
+  --create-default-config   create default config file
+
+
+-----------------
+| Config file   |
+-----------------
+
+The config file has the standard python ini-like syntax.
+Example:
+
+
+    [DEFAULT]
+    my_topdir: /media/usb
+    inview: by_initial
+    
+    [by_arrival]
+    output_dir: %(my_topdir)s/music_sorted/by_arrival
+    
+    [by_initial]
+    output_dir: %(my_topdir)s/audio/music
+    
+    [by_initial_and_year]
+    output_dir: %(my_topdir)s/music_sorted/by_initial_and_year
+    
+    [by_date]
+    output_dir: %(my_topdir)s/music_sorted/by_date
