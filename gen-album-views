@@ -746,6 +746,14 @@ def main(argv=sys.argv):
             help='create default config file')
     (options, args) = parser.parse_args(argv[1:])
 
+    # search for config file in CONFIG_ROOT if not absolute
+    if not os.path.exists(options.config_filename) and not os.sep in options.config_filename:
+        cfg = os.path.join(CONFIG_ROOT, options.config_filename)
+        if not os.path.exists(cfg):
+            cfg = cfg + '.conf'
+        if os.path.exists(cfg):
+            options.config_filename = cfg
+
     config = ConfigParser.ConfigParser()
     if not config.read(options.config_filename):
         if options.create_defconf:
