@@ -266,7 +266,9 @@ class MusicDirCheck(MusicDir):
         Log.error('Duplicate releases found:\n1st: %s\n2nd: %s', old['path'], root)
 
 class view(object):
-    def __init__(self, options={}, is_inview=False):
+    def __init__(self, options=None, is_inview=False):
+        if not options:
+            options = {}
         self.path = os.path.expanduser(options['output_dir'])
         self.options = options
     def parse(self, path, rel_path):
@@ -288,7 +290,7 @@ class view_by_arrival(view):
     name = 'by_arrival'
     album_pattern = [r'(?P<arrival>[0-9]{4})', r'(?P<artist>.*)', r'(?P<album>.*)']
     album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
-    def __init__(self, options={}, is_inview=False):
+    def __init__(self, options=None, is_inview=False):
         super(view_by_arrival,self).__init__(options, is_inview)
         if 'index_dir' in options:
             self.index_dir = os.path.expanduser(options['index_dir'])
@@ -347,7 +349,7 @@ class view_by_initial_range(view):
     name = 'by_initial_range'
     album_pattern = [r'(?:A-[B-X]|[C-Y]-Z)', r'(?P<artist>.*)', r'(?P<album>.*)']
     album_regexp = re.compile(re.escape(os.sep).join(album_pattern))
-    def __init__(self, options={}, is_inview=False):
+    def __init__(self, options=None, is_inview=False):
         super(view_by_initial_range,self).__init__(options, is_inview)
         if 'split_letter' in self.options:
             self.middle = self.options['split_letter'].upper()
@@ -706,7 +708,10 @@ def close_cmd_file():
     if Log.cmd_file:
         Log.cmd_file.close()
 
-def main(argv=sys.argv):
+def main(argv=None):
+
+    if not argv:
+        argv = sys.argv
 
     global PIDFILE
 
